@@ -15,8 +15,9 @@ Sanal masaüstleri arasında pencere taşıma ve sabitleme için Windhawk modu (
 - Doğrulama: Windhawk'ta derle, gerçek masaüstlerinde kısayolları dene, Windhawk log'unda
   `RegisterHotKey` sonuçlarına bak (Win tuşlu kombinasyonların kaydı ayrıca kontrol edilir).
   Commit öncesi derleme kontrolü Windhawk dışından da yapılabilir: `C:\Program Files\Windhawk\Compiler\bin\clang++.exe`
-  ile `Compiler\compile_flags.txt` bayrakları + `-DWH_MOD_ID=L"desktop-window-keys" -DWH_MOD_VERSION=L"x" -Wall -c`
-  (link adımı `InternalWh_*` sembolleri yüzünden Windhawk dışında başarısız olur, bu beklenir).
+  ile `Compiler\compile_flags.txt` bayrakları + `-DWH_MOD_ID=L"desktop-window-keys" -DWH_MOD_VERSION=L"x" -Wall`
+  ve `-c` yerine `-shared -lole32 -loleaut32 -luuid -o <tmp>.dll` ile tam link (Windhawk'taki linker hatalarını
+  da yakalar; yalnız `-c` yakalamaz). MinGW `MIDL_INTERFACE` için `__uuidof` üretmez; IID'ler açık sabit olarak tanımlanır.
 - Mod hiç tepki vermiyorsa önce süreç listesinde `windhawk.exe -tool-mod "local@desktop-window-keys"`
   var mı bak; yoksa sorun kod değil, sürecin başlamaması. Log için editörde "Enable logging" açık olmalı.
 - Yönetici yetkili pencere öndeyken `SendInput` UIPI ile sessizce düşer (dönüş değeri başarılı);
