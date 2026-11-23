@@ -15,6 +15,10 @@ komşu masaüstüne taşır ve pencereyi tüm masaüstlerine sabitler.
   modu Win+Ctrl+Sol/Sağ geçişini de böyle döndürür; ikisi tutarlı kalır.
 - **Ayar: "Taşınan pencereyi takip et".** İşaretliyse pencereyle birlikte hedef masaüstüne
   geçilir. İşaretli değilse yalnız pencere gider, kullanıcı bulunduğu masaüstünde kalır.
+- **Animasyon yalnız 24H2+:** Takipte kayma animasyonlu COM geçişi (`SwitchDesktopWithAnimation`)
+  yalnız gerçek build 26100 ve üstündeyse kullanılır (slot 22). Daha eski buildlerde, ayar ne olursa
+  olsun, geçiş animasyonsuzdur: 23H2'nin slot 21'i gerçek makinede denenmedi, yanlış slot
+  bellek bozar (24H2'de slot 22, 23H2'de `GetLastActiveDesktop`).
 - **Kenarda animasyon yönü:** Takip açıkken kenardan dönüşte geçiş Explorer'ın Win+Ctrl+Ok
   kısayolu enjekte edilerek yapılır; animasyon basılan yöne kayar, döngüyü Virtual Desktop
   Hotkey Cycle yapar. Öndeki pencere yönetici yetkiliyse Windows (UIPI) enjeksiyonu engeller;
