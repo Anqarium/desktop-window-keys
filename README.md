@@ -24,6 +24,19 @@ komşu masaüstüne taşır ve pencereyi tüm masaüstlerine sabitler.
   kaldırır; zaten o durumdaki pencerede bir şey yapmaz. Sabitleme `IVirtualDesktopPinnedApps`
   (`PinView`/`UnpinView`) ile yapılır; IID'si Windows sürümüne göre değişmez, servis alınamazsa
   yalnız sabitleme kısayolları devre dışı kalır, taşıma çalışır.
+- **Sabitleme rozeti:** Kısayolla sabitlenen pencerenin sağ üst köşesinde Windows vurgu
+  renginde küçük, yarı saydam, tıklamayı geçiren bir nokta durur. Nokta modun kendi penceresidir
+  (katmanlı, `WS_EX_TRANSPARENT`) ve Z sırasında hedefin hemen üstünde tutulur. Böylece büyütülmüş
+  ve tam ekran pencerede de görünür, üstüne gelen pencerelerin altında kalır.
+  `SetWinEventHook` ile konum, ön plan, küçültme ve yok olma izlenir. Hook'lar yalnız rozet
+  varken açıktır. Saniyelik bir denetim Görev Görünümü'nden kaldırılan sabitlemeyi ve kapanan
+  pencereyi yakalar.
+  - Kenarlık rengi (`DWMWA_BORDER_COLOR`) denendi, bırakıldı: büyütülmüş ve tam ekran pencerede
+    kenarlık görünmüyor, yönetici pencerelerinde de UIPI çağrıyı reddediyor.
+  - Yalnız Görev Görünümü'nden sabitlenen pencereler rozet almaz.
+  - Yönetici yetkili pencerenin (ör. Windhawk editörü) yanına Z sırasında yerleştirme UIPI
+    yüzünden `ERROR_ACCESS_DENIED` verir. O pencerede rozet yalnız pencere öndeyken
+    `HWND_TOPMOST` olarak görünür, öbür zamanlar gizlenir.
 - Kısayollar sabit: modun kaynak aldığı modeldeki Alt tabanlı varsayılanlar kullanılmaz. Bir
   kısayol başka bir uygulama tarafından kullanılıyorsa kayıt başarısızlığı loglanır.
 - Windows'ta bu işlemlerin yerleşik karşılığı yalnızca Görev Görünümü'ndeki (Win+Tab) sağ tık

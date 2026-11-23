@@ -2,12 +2,12 @@
 // @id              desktop-window-keys
 // @name            Desktop Window Keys
 // @description     Move the active window between virtual desktops (Ctrl+Win+Shift+Left/Right) and pin it to all desktops (Up/Down)
-// @version         0.2.1
+// @version         0.3.0
 // @author          Anqarium
 // @include         windhawk.exe
 // @include         windhawk-mod.exe
 // @include         windhawk-mod-uiaccess.exe
-// @compilerOptions -lole32 -loleaut32 -luuid
+// @compilerOptions -lole32 -loleaut32 -luuid -ldwmapi -lgdi32
 // ==/WindhawkMod==
 
 // ==WindhawkModReadme==
@@ -25,6 +25,10 @@ Moves the active window between virtual desktops and pins it to all desktops wit
 
 Pinning is the same as "Show this window on all desktops" in Task View (Win+Tab).
 Up and Down only set the state, so pressing Up twice keeps the window pinned.
+A window pinned with the hotkey gets a small dot in the Windows accent color in its
+top-right corner, also when maximized or full screen. The dot ignores the mouse and
+disappears when the window is unpinned (with Down or from Task View) or closed.
+Windows pinned only from Task View get no dot.
 
 Moving wraps around: Right on the last desktop goes to the first one, Left on the
 first desktop goes to the last one (same as the Virtual Desktop Hotkey Cycle mod).
@@ -75,10 +79,12 @@ by u2x1 (v2.5.0), itself based on
 #include <initguid.h>
 #include <objbase.h>
 #include <objectarray.h>
+#include <dwmapi.h>
 #include <shobjidl.h>
 #include <windhawk_utils.h>
 #include <windows.h>
 #include <atomic>
+#include <vector>
 
 #define SAFE_RELEASE(p) \
   do {                  \
@@ -221,6 +227,24 @@ static constexpr UINT WM_APP_SETTINGS_CHANGED = WM_APP + 1;
 static constexpr wchar_t kHotkeyWindowClassName[] = L"WindhawkDesktopWindowKeysHotkeys";
 
 static bool g_followMovedWindow = false;
+
+// Pin badge (see "Pin badge" below). Sizes are at 96 DPI and scaled per window.
+static constexpr wchar_t kBadgeWindowClassName[] = L"WindhawkDesktopWindowKeysBadge";
+static constexpr COLORREF kFallbackBadgeColor = RGB(0, 120, 215);  // if the accent color is unavailable
+static constexpr int kBadgeSizePx = 8;
+static constexpr int kBadgeMarginPx = 6;
+static constexpr BYTE kBadgeAlpha = 200;
+static constexpr UINT_PTR kBadgeCheckTimerId = 1;
+static constexpr UINT kBadgeCheckIntervalMs = 1000;
+
+struct PinBadge {
+  HWND target;  // the pinned window
+  HWND badge;   // our dot window
+  int size;     // current size in physical pixels
+  bool zOrderDenied;  // target has a higher integrity level (UIPI): shown only while it is in front
+};
+static std::vector<PinBadge> g_badges;  // hotkey thread only
+static HWINEVENTHOOK g_badgeHooks[2] = {};
 
 enum HotkeyIds { HK_MOVE_PREV = 1, HK_MOVE_NEXT = 2, HK_PIN = 3, HK_UNPIN = 4 };
 
@@ -599,6 +623,207 @@ bool MoveActiveWindowByOffset(int direction) {
   return success;
 }
 
+// The Windows accent color (Settings > Personalization > Colors) as a COLORREF.
+COLORREF GetAccentColor() {
+  DWORD argb = 0;
+  BOOL opaque = FALSE;
+  if (FAILED(DwmGetColorizationColor(&argb, &opaque))) return kFallbackBadgeColor;
+  // 0xAARRGGBB -> COLORREF (0x00BBGGRR); the alpha byte is dropped.
+  return RGB((argb >> 16) & 0xFF, (argb >> 8) & 0xFF, argb & 0xFF);
+}
+
+//=============================================================================
+// Pin badge: a small click-through accent-colored dot in the top-right corner of
+// each window pinned with the hotkey. It is our own window kept directly above the
+// pinned window in the Z-order, so it shows on maximized and full-screen windows
+// too and stays hidden behind windows that cover the pinned one. Everything here
+// runs on the hotkey thread.
+//=============================================================================
+
+bool IsWindowPinned(HWND hwnd) {
+  if (!g_pPinnedApps || !g_pViewCollection) return false;
+  IApplicationView* view = nullptr;
+  if (FAILED(g_pViewCollection->GetViewForHwnd(hwnd, &view)) || !view) return false;
+  BOOL pinned = FALSE;
+  bool ok = SUCCEEDED(g_pPinnedApps->IsViewPinned(view, &pinned));
+  view->Release();
+  return ok && pinned;
+}
+
+PinBadge* FindBadge(HWND target) {
+  for (auto& badge : g_badges) {
+    if (badge.target == target) return &badge;
+  }
+  return nullptr;
+}
+
+void UpdateBadge(PinBadge& badge) {
+  if (IsIconic(badge.target) || !IsWindowVisible(badge.target)) {
+    ShowWindow(badge.badge, SW_HIDE);
+    return;
+  }
+
+  // Extended frame bounds exclude the invisible resize borders of GetWindowRect.
+  RECT rect;
+  if (FAILED(DwmGetWindowAttribute(badge.target, DWMWA_EXTENDED_FRAME_BOUNDS, &rect, sizeof(rect)))) {
+    GetWindowRect(badge.target, &rect);
+  }
+
+  UINT dpi = GetDpiForWindow(badge.target);
+  if (!dpi) dpi = USER_DEFAULT_SCREEN_DPI;
+  int size = MulDiv(kBadgeSizePx, dpi, USER_DEFAULT_SCREEN_DPI);
+  int margin = MulDiv(kBadgeMarginPx, dpi, USER_DEFAULT_SCREEN_DPI);
+  if (size != badge.size) {
+    badge.size = size;
+    SetWindowRgn(badge.badge, CreateEllipticRgn(0, 0, size + 1, size + 1), TRUE);  // the system owns the region
+  }
+
+  UINT flags = SWP_NOACTIVATE | SWP_SHOWWINDOW;
+  HWND insertAfter;
+  if (badge.zOrderDenied) {
+    // Windows refuses to place our window next to an elevated one in the Z-order, so
+    // float the badge over everything while the target is in front and hide it otherwise.
+    if (GetForegroundWindow() != badge.target) {
+      ShowWindow(badge.badge, SW_HIDE);
+      return;
+    }
+    insertAfter = HWND_TOPMOST;
+  } else {
+    // Insert the badge right below the window above the target, i.e. directly above it.
+    insertAfter = GetWindow(badge.target, GW_HWNDPREV);
+    if (insertAfter == badge.badge) {
+      flags |= SWP_NOZORDER;
+    } else if (!insertAfter) {
+      insertAfter = (GetWindowLongPtr(badge.target, GWL_EXSTYLE) & WS_EX_TOPMOST) ? HWND_TOPMOST : HWND_TOP;
+    }
+  }
+
+  if (!SetWindowPos(badge.badge, insertAfter, rect.right - margin - size, rect.top + margin, size, size, flags)) {
+    DWORD error = GetLastError();
+    if (error == ERROR_ACCESS_DENIED && !badge.zOrderDenied) {
+      Wh_Log(L"Pin badge Z-order denied (elevated window 0x%p?); showing it only while in front", badge.target);
+      badge.zOrderDenied = true;
+      UpdateBadge(badge);
+      return;
+    }
+    Wh_Log(L"Failed to position pin badge: %lu", error);
+  }
+}
+
+void UpdateAllBadges() {
+  for (auto& badge : g_badges) UpdateBadge(badge);
+}
+
+void RemoveBadgeAt(size_t index);
+
+void CALLBACK BadgeWinEventProc(HWINEVENTHOOK, DWORD event, HWND hwnd, LONG idObject, LONG idChild, DWORD, DWORD) {
+  if (event == EVENT_SYSTEM_FOREGROUND) {
+    UpdateAllBadges();  // activating a window changes the Z-order of the others
+    return;
+  }
+  if (idObject != OBJID_WINDOW || idChild != CHILDID_SELF) return;
+
+  for (size_t i = 0; i < g_badges.size(); ++i) {
+    if (g_badges[i].target != hwnd) continue;
+    if (event == EVENT_OBJECT_DESTROY) {
+      RemoveBadgeAt(i);
+    } else {
+      UpdateBadge(g_badges[i]);
+    }
+    return;
+  }
+}
+
+// The event hooks and the check timer exist only while at least one badge is shown,
+// so the global location-change stream is not processed when nothing is pinned.
+void StartBadgeTracking() {
+  if (g_badgeHooks[0]) return;
+  constexpr DWORD kFlags = WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS;
+  g_badgeHooks[0] = SetWinEventHook(EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_MINIMIZEEND, nullptr, BadgeWinEventProc,
+                                    0, 0, kFlags);
+  g_badgeHooks[1] = SetWinEventHook(EVENT_OBJECT_DESTROY, EVENT_OBJECT_LOCATIONCHANGE, nullptr, BadgeWinEventProc,
+                                    0, 0, kFlags);
+  if (!g_badgeHooks[0] || !g_badgeHooks[1]) Wh_Log(L"SetWinEventHook failed: %lu", GetLastError());
+  if (HWND msgWnd = g_hMsgWnd.load()) SetTimer(msgWnd, kBadgeCheckTimerId, kBadgeCheckIntervalMs, nullptr);
+}
+
+void StopBadgeTracking() {
+  for (auto& hook : g_badgeHooks) {
+    if (hook) UnhookWinEvent(hook);
+    hook = nullptr;
+  }
+  if (HWND msgWnd = g_hMsgWnd.load()) KillTimer(msgWnd, kBadgeCheckTimerId);
+}
+
+void RemoveBadgeAt(size_t index) {
+  DestroyWindow(g_badges[index].badge);
+  g_badges.erase(g_badges.begin() + index);
+  if (g_badges.empty()) StopBadgeTracking();
+}
+
+void RemoveBadge(HWND target) {
+  for (size_t i = 0; i < g_badges.size(); ++i) {
+    if (g_badges[i].target == target) {
+      RemoveBadgeAt(i);
+      return;
+    }
+  }
+}
+
+void RemoveAllBadges() {
+  while (!g_badges.empty()) RemoveBadgeAt(g_badges.size() - 1);
+}
+
+void ShowBadge(HWND target) {
+  if (PinBadge* existing = FindBadge(target)) {
+    UpdateBadge(*existing);
+    return;
+  }
+
+  HWND badgeWnd = CreateWindowExW(WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
+                                  kBadgeWindowClassName, nullptr, WS_POPUP, 0, 0, 0, 0, nullptr, nullptr,
+                                  GetModuleHandle(nullptr), nullptr);
+  if (!badgeWnd) {
+    Wh_Log(L"Failed to create pin badge: %lu", GetLastError());
+    return;
+  }
+  SetLayeredWindowAttributes(badgeWnd, 0, kBadgeAlpha, LWA_ALPHA);
+
+  g_badges.push_back({target, badgeWnd, 0, false});
+  StartBadgeTracking();
+  UpdateBadge(g_badges.back());
+}
+
+// Safety net for what the event hooks do not report: unpinning from Task View and
+// windows that vanished without a destroy event.
+void OnBadgeCheckTimer() {
+  for (size_t i = g_badges.size(); i-- > 0;) {
+    if (!IsWindow(g_badges[i].target) || !IsWindowPinned(g_badges[i].target)) {
+      RemoveBadgeAt(i);
+    }
+  }
+}
+
+LRESULT CALLBACK BadgeWindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam) {
+  switch (message) {
+    case WM_PAINT: {
+      PAINTSTRUCT ps;
+      HDC dc = BeginPaint(hwnd, &ps);
+      HBRUSH brush = CreateSolidBrush(GetAccentColor());
+      FillRect(dc, &ps.rcPaint, brush);
+      DeleteObject(brush);
+      EndPaint(hwnd, &ps);
+      return 0;
+    }
+    case WM_DWMCOLORIZATIONCOLORCHANGED:
+      InvalidateRect(hwnd, nullptr, TRUE);  // follow accent color changes
+      return 0;
+    case WM_NCHITTEST:
+      return HTTRANSPARENT;
+  }
+  return DefWindowProc(hwnd, message, wParam, lParam);
+}
+
 // Pin the active window to all desktops (|pin| = true) or unpin it. Sets the state
 // instead of toggling, so each hotkey has one predictable result.
 bool SetActiveWindowPinned(bool pin) {
@@ -632,6 +857,11 @@ bool SetActiveWindowPinned(bool pin) {
     return false;
   }
   Wh_Log(L"Window %s", pin ? L"pinned" : L"unpinned");
+  if (pin) {
+    ShowBadge(hwnd);
+  } else {
+    RemoveBadge(hwnd);
+  }
   return true;
 }
 
@@ -685,6 +915,11 @@ LRESULT CALLBACK HotkeyWindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM
     return 0;
   }
 
+  if (message == WM_TIMER && wParam == kBadgeCheckTimerId) {
+    OnBadgeCheckTimer();
+    return 0;
+  }
+
   if (message == WM_APP_SETTINGS_CHANGED) {
     if (!g_hotkeyThreadRunning) return 0;
 
@@ -713,7 +948,20 @@ DWORD WINAPI HotkeyThreadProc(LPVOID) {
     return 0;
   }
 
+  // Badge positions come from other windows' physical-pixel bounds.
+  SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+
   HINSTANCE module = GetModuleHandle(nullptr);
+  WNDCLASSEXW badgeClass = {
+      .cbSize = sizeof(badgeClass),
+      .lpfnWndProc = BadgeWindowProc,
+      .hInstance = module,
+      .lpszClassName = kBadgeWindowClassName,
+  };
+  if (!RegisterClassExW(&badgeClass)) {
+    Wh_Log(L"Failed to register pin badge window class: %lu", GetLastError());  // pinning still works
+  }
+
   WNDCLASSEXW windowClass = {
       .cbSize = sizeof(windowClass),
       .lpfnWndProc = HotkeyWindowProc,
@@ -758,11 +1006,13 @@ DWORD WINAPI HotkeyThreadProc(LPVOID) {
     DispatchMessage(&msg);
   }
 
+  RemoveAllBadges();  // before g_hMsgWnd is cleared: it also kills the check timer
   g_hMsgWnd = nullptr;
   UnregisterHotkeys(hwnd);
   CleanupVirtualDesktopAPI();
   DestroyWindow(hwnd);
   UnregisterClassW(kHotkeyWindowClassName, module);
+  UnregisterClassW(kBadgeWindowClassName, module);
   CoUninitialize();
 
   g_hotkeyThreadRunning = false;
