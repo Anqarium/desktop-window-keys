@@ -1,0 +1,776 @@
+// ==WindhawkMod==
+// @id              desktop-window-keys
+// @name            Desktop Window Keys
+// @description     Move the active window to the previous/next virtual desktop with Ctrl+Win+Shift+Left/Right
+// @version         0.1.0
+// @author          Anqarium
+// @include         windhawk.exe
+// @compilerOptions -lole32 -loleaut32 -luuid
+// ==/WindhawkMod==
+
+// ==WindhawkModReadme==
+/*
+# Desktop Window Keys
+
+Moves the active window between virtual desktops with the keyboard.
+
+| Hotkey | Action |
+|---|---|
+| `Ctrl+Win+Shift+Left` | Move the active window to the previous desktop |
+| `Ctrl+Win+Shift+Right` | Move the active window to the next desktop |
+
+Moving wraps around: Right on the last desktop goes to the first one, Left on the
+first desktop goes to the last one (same as the Virtual Desktop Hotkey Cycle mod).
+
+With **Follow Moved Window** enabled you switch to the target desktop together with
+the window; otherwise only the window moves and you stay where you are.
+
+If another program already owns a hotkey, the registration failure is written to the
+Windhawk log.
+
+Select your Windows version in the settings (run `winver` to check the build number);
+the undocumented virtual desktop COM interfaces change IDs between Windows builds.
+
+## Credits
+
+Based on the COM interface definitions, the Windows version IID table and the hotkey
+thread of [Virtual Desktop Helper](https://github.com/ramensoftware/windhawk-mods/blob/dc9cd28419f63d2d86396bcb845cf8e307186d5e/mods/virtual-desktop-helper.wh.cpp)
+by u2x1 (v2.5.0), itself based on
+[VirtualDesktopAccessor](https://github.com/Ciantic/VirtualDesktopAccessor).
+*/
+// ==/WindhawkModReadme==
+
+// ==WindhawkModSettings==
+/*
+- WindowsVersion: win11_26100
+  $name: Windows Version
+  $description: Select your Windows version for correct COM interface IDs. Run "winver" to check your build number.
+  $options:
+    - win10_old: Windows 10 (Build < 20348)
+    - win10_20348: Windows 10 (Build 20348 - 21999)
+    - win11_22000: Windows 11 (Build 22000 - 22482)
+    - win11_22621: Windows 11 (Build 22621/22631/23H2)
+    - win11_26100: Windows 11 (Build 26100+ / 24H2)
+
+- FollowMovedWindow: false
+  $name: Follow Moved Window
+  $description: Switch to the target desktop together with the moved window. When off, only the window moves.
+*/
+// ==/WindhawkModSettings==
+
+#include <initguid.h>
+#include <objbase.h>
+#include <objectarray.h>
+#include <shobjidl.h>
+#include <windhawk_utils.h>
+#include <windows.h>
+#include <atomic>
+
+#define SAFE_RELEASE(p) \
+  do {                  \
+    if (p) {            \
+      (p)->Release();   \
+      (p) = nullptr;    \
+    }                   \
+  } while (0)
+
+//=============================================================================
+// COM CLSIDs and IIDs for the (undocumented) Virtual Desktop API.
+// Reference: https://github.com/Ciantic/VirtualDesktopAccessor
+//=============================================================================
+
+// CLSID_ImmersiveShell: {C2F03A33-21F5-47FA-B4BB-156362A2F239}
+static const CLSID CLSID_ImmersiveShell = {
+    0xC2F03A33, 0x21F5, 0x47FA, {0xB4, 0xBB, 0x15, 0x63, 0x62, 0xA2, 0xF2, 0x39}};
+
+// CLSID_VirtualDesktopManagerInternal: {C5E0CDCA-7B6E-41B2-9FC4-D93975CC467B}
+static const CLSID CLSID_VirtualDesktopManagerInternal = {
+    0xC5E0CDCA, 0x7B6E, 0x41B2, {0x9F, 0xC4, 0xD9, 0x39, 0x75, 0xCC, 0x46, 0x7B}};
+
+// IID_IApplicationViewCollection: {1841C6D7-4F9D-42C0-AF41-8747538F10E5}
+static const IID IID_IApplicationViewCollection = {
+    0x1841C6D7, 0x4F9D, 0x42C0, {0xAF, 0x41, 0x87, 0x47, 0x53, 0x8F, 0x10, 0xE5}};
+
+// Microsoft changes these IIDs between Windows builds. usesHMonitor: some builds
+// take an HMONITOR as the first argument of the manager methods.
+// Source: Virtual Desktop Helper v2.5.0 (u2x1), VirtualDesktopAccessor.
+struct VersionIIDs {
+  IID managerInternal;  // IVirtualDesktopManagerInternal
+  IID virtualDesktop;   // IVirtualDesktop
+  bool usesHMonitor;
+};
+
+static const VersionIIDs g_versionIIDs[] = {
+    // [0] Windows 10 (Build < 20348)
+    {{0xF31574D6, 0xB682, 0x4CDC, {0xBD, 0x56, 0x18, 0x27, 0x86, 0x0A, 0xBE, 0xC6}},
+     {0xFF72FFDD, 0xBE7E, 0x43FC, {0x9C, 0x03, 0xAD, 0x81, 0x68, 0x1E, 0x88, 0xE4}},
+     false},
+    // [1] Windows 10 (Build 20348 - 21999)
+    {{0x094AFE11, 0x44F2, 0x4BA0, {0x97, 0x6F, 0x29, 0xA9, 0x7E, 0x26, 0x3E, 0xE0}},
+     {0x62FDF88B, 0x11CA, 0x4AFB, {0x8B, 0xD8, 0x22, 0x96, 0xDF, 0xAE, 0x49, 0xE2}},
+     true},
+    // [2] Windows 11 (Build 22000 - 22482)
+    {{0xB2F925B9, 0x5A0F, 0x4D2E, {0x9F, 0x4D, 0x2B, 0x15, 0x07, 0x59, 0x3C, 0x10}},
+     {0x536D3495, 0xB208, 0x4CC9, {0xAE, 0x26, 0xDE, 0x81, 0x11, 0x27, 0x5B, 0xF8}},
+     true},
+    // [3] Windows 11 (Build 22621/22631/23H2)
+    {{0xA3175F2D, 0x239C, 0x4BD2, {0x8A, 0xA0, 0xEE, 0xBA, 0x8B, 0x0B, 0x13, 0x8E}},
+     {0x3F07F4BE, 0xB107, 0x441A, {0xAF, 0x0F, 0x39, 0xD8, 0x25, 0x29, 0x07, 0x2C}},
+     false},
+    // [4] Windows 11 (Build 26100+ / 24H2)
+    {{0x53F5CA0B, 0x158F, 0x4124, {0x90, 0x0C, 0x05, 0x71, 0x58, 0x06, 0x0B, 0x27}},
+     {0x3F07F4BE, 0xB107, 0x441A, {0xAF, 0x0F, 0x39, 0xD8, 0x25, 0x29, 0x07, 0x2C}},
+     false},
+};
+
+// Default to Windows 11 24H2.
+static int g_windowsVersionIndex = 4;
+
+//=============================================================================
+// COM interface definitions (reverse-engineered; VTable layout varies by build)
+//=============================================================================
+
+struct IVirtualDesktop : public IUnknown {
+  virtual HRESULT STDMETHODCALLTYPE IsViewVisible(IUnknown*, BOOL*) = 0;
+  virtual HRESULT STDMETHODCALLTYPE GetId(GUID*) = 0;
+};
+struct IApplicationView : public IUnknown {};
+
+MIDL_INTERFACE("1841C6D7-4F9D-42C0-AF41-8747538F10E5")
+IApplicationViewCollection : public IUnknown {
+  virtual HRESULT STDMETHODCALLTYPE GetViews(IObjectArray**) = 0;
+  virtual HRESULT STDMETHODCALLTYPE GetViewsByZOrder(IObjectArray**) = 0;
+  virtual HRESULT STDMETHODCALLTYPE GetViewsByAppUserModelId(LPCWSTR, IObjectArray**) = 0;
+  virtual HRESULT STDMETHODCALLTYPE GetViewForHwnd(HWND, IApplicationView**) = 0;
+};
+
+struct IVirtualDesktopManagerInternal : public IUnknown {};
+
+// IVirtualDesktopManagerInternal VTable indices (IUnknown occupies 0-2).
+static const int VTABLE_MOVE_VIEW_TO_DESKTOP = 4;
+static const int VTABLE_GET_CURRENT_DESKTOP = 6;
+static const int VTABLE_GET_DESKTOPS = 7;
+static const int VTABLE_SWITCH_DESKTOP = 9;
+
+//=============================================================================
+// Global state
+//=============================================================================
+
+static IServiceProvider* g_pServiceProvider = nullptr;
+static IVirtualDesktopManagerInternal* g_pDesktopManagerInternal = nullptr;
+static IApplicationViewCollection* g_pViewCollection = nullptr;
+static bool g_bInitialized = false;
+
+static HANDLE g_hThread = nullptr;
+static std::atomic<HWND> g_hMsgWnd = nullptr;
+static std::atomic_bool g_hotkeyThreadRunning = false;
+static std::atomic_bool g_settingsReloadPending = false;
+
+static constexpr UINT WM_APP_SETTINGS_CHANGED = WM_APP + 1;
+static constexpr wchar_t kHotkeyWindowClassName[] = L"WindhawkDesktopWindowKeysHotkeys";
+
+static bool g_followMovedWindow = false;
+
+enum HotkeyIds { HK_MOVE_PREV = 1, HK_MOVE_NEXT = 2 };
+
+// Ctrl+Win+Shift, fixed by design (see README).
+static constexpr UINT kHotkeyModifiers = MOD_CONTROL | MOD_WIN | MOD_SHIFT | MOD_NOREPEAT;
+
+//=============================================================================
+// Helpers
+//=============================================================================
+
+// Access a VTable function by index for the undocumented COM interfaces.
+template <typename T>
+T GetVTableFunction(void* pInterface, int index) {
+  return reinterpret_cast<T>((*reinterpret_cast<void***>(pInterface))[index]);
+}
+
+bool InitializeVirtualDesktopAPI();
+bool ReinitializeVirtualDesktopAPI();
+
+bool UsesHMonitorParameter() { return g_versionIIDs[g_windowsVersionIndex].usesHMonitor; }
+
+int ParseWindowsVersion(PCWSTR str) {
+  static const struct {
+    PCWSTR name;
+    int index;
+  } kVersionMap[] = {
+      {L"win10_old", 0}, {L"win10_20348", 1}, {L"win11_22000", 2}, {L"win11_22621", 3}, {L"win11_26100", 4}};
+  for (const auto& entry : kVersionMap) {
+    if (str && wcscmp(str, entry.name) == 0) return entry.index;
+  }
+  return 4;
+}
+
+void LoadSettings() {
+  PCWSTR version = Wh_GetStringSetting(L"WindowsVersion");
+  g_windowsVersionIndex = ParseWindowsVersion(version);
+  Wh_FreeStringSetting(version);
+
+  g_followMovedWindow = Wh_GetIntSetting(L"FollowMovedWindow") != 0;
+  Wh_Log(L"LoadSettings: versionIndex=%d, follow=%d", g_windowsVersionIndex, g_followMovedWindow);
+}
+
+//=============================================================================
+// Virtual Desktop API initialization
+//=============================================================================
+
+bool InitializeVirtualDesktopAPIOnce() {
+  HRESULT hr = CoCreateInstance(CLSID_ImmersiveShell, nullptr, CLSCTX_LOCAL_SERVER, IID_IServiceProvider,
+                                (void**)&g_pServiceProvider);
+  if (FAILED(hr) || !g_pServiceProvider) {
+    Wh_Log(L"Failed to create ImmersiveShell: 0x%08X", hr);
+    return false;
+  }
+
+  hr = g_pServiceProvider->QueryService(CLSID_VirtualDesktopManagerInternal,
+                                        g_versionIIDs[g_windowsVersionIndex].managerInternal,
+                                        (void**)&g_pDesktopManagerInternal);
+  if (FAILED(hr) || !g_pDesktopManagerInternal) {
+    Wh_Log(L"Failed to get VirtualDesktopManagerInternal (wrong Windows version setting?): 0x%08X", hr);
+    SAFE_RELEASE(g_pServiceProvider);
+    return false;
+  }
+
+  hr = g_pServiceProvider->QueryService(IID_IApplicationViewCollection, IID_IApplicationViewCollection,
+                                        (void**)&g_pViewCollection);
+  if (FAILED(hr) || !g_pViewCollection) {
+    Wh_Log(L"Failed to get ApplicationViewCollection: 0x%08X", hr);
+    SAFE_RELEASE(g_pDesktopManagerInternal);
+    SAFE_RELEASE(g_pServiceProvider);
+    return false;
+  }
+
+  return true;
+}
+
+bool InitializeVirtualDesktopAPI() {
+  if (g_bInitialized) return true;
+  if (InitializeVirtualDesktopAPIOnce()) {
+    g_bInitialized = true;
+    return true;
+  }
+  return false;
+}
+
+void CleanupVirtualDesktopAPI() {
+  // If Explorer is gone, Release() on its COM objects can hang: drop the pointers instead.
+  HWND hShell = GetShellWindow();
+  if (!hShell || !IsWindow(hShell)) {
+    Wh_Log(L"Explorer not available, skipping COM cleanup to avoid hang");
+    g_pViewCollection = nullptr;
+    g_pDesktopManagerInternal = nullptr;
+    g_pServiceProvider = nullptr;
+    g_bInitialized = false;
+    return;
+  }
+
+  SAFE_RELEASE(g_pViewCollection);
+  SAFE_RELEASE(g_pDesktopManagerInternal);
+  SAFE_RELEASE(g_pServiceProvider);
+  g_bInitialized = false;
+}
+
+bool ReinitializeVirtualDesktopAPI() {
+  CleanupVirtualDesktopAPI();
+  return InitializeVirtualDesktopAPI();
+}
+
+// VTable call for methods returning a value, with the optional HMONITOR parameter
+// (varies by Windows version). Reinitializes once in case explorer.exe restarted.
+template <typename TResult>
+HRESULT CallManagerInternal(int vtableIndex, TResult* outResult) {
+  for (int attempt = 0; attempt < 2; ++attempt) {
+    HRESULT hr;
+    if (UsesHMonitorParameter()) {
+      auto pfn = GetVTableFunction<HRESULT(STDMETHODCALLTYPE*)(void*, HMONITOR, TResult*)>(g_pDesktopManagerInternal,
+                                                                                           vtableIndex);
+      hr = pfn(g_pDesktopManagerInternal, nullptr, outResult);
+    } else {
+      auto pfn = GetVTableFunction<HRESULT(STDMETHODCALLTYPE*)(void*, TResult*)>(g_pDesktopManagerInternal,
+                                                                                vtableIndex);
+      hr = pfn(g_pDesktopManagerInternal, outResult);
+    }
+    if (SUCCEEDED(hr) || attempt == 1 || !ReinitializeVirtualDesktopAPI()) return hr;
+  }
+  return E_FAIL;
+}
+
+// Same, for methods taking one argument.
+template <typename TArg>
+HRESULT CallManagerInternalWithArg(int vtableIndex, TArg arg) {
+  for (int attempt = 0; attempt < 2; ++attempt) {
+    HRESULT hr;
+    if (UsesHMonitorParameter()) {
+      auto pfn = GetVTableFunction<HRESULT(STDMETHODCALLTYPE*)(void*, HMONITOR, TArg)>(g_pDesktopManagerInternal,
+                                                                                      vtableIndex);
+      hr = pfn(g_pDesktopManagerInternal, nullptr, arg);
+    } else {
+      auto pfn = GetVTableFunction<HRESULT(STDMETHODCALLTYPE*)(void*, TArg)>(g_pDesktopManagerInternal,
+                                                                            vtableIndex);
+      hr = pfn(g_pDesktopManagerInternal, arg);
+    }
+    if (SUCCEEDED(hr) || attempt == 1 || !ReinitializeVirtualDesktopAPI()) return hr;
+  }
+  return E_FAIL;
+}
+
+//=============================================================================
+// Virtual desktop operations
+//=============================================================================
+
+IObjectArray* GetDesktops() {
+  if (!g_pDesktopManagerInternal) return nullptr;
+  IObjectArray* desktops = nullptr;
+  HRESULT hr = CallManagerInternal(VTABLE_GET_DESKTOPS, &desktops);
+  if (FAILED(hr)) Wh_Log(L"GetDesktops failed: 0x%08X", hr);
+  return desktops;
+}
+
+// Returns the desktop at |index| (caller releases), or nullptr.
+IVirtualDesktop* GetDesktopByIndex(IObjectArray* desktops, UINT index) {
+  IVirtualDesktop* desktop = nullptr;
+  desktops->GetAt(index, g_versionIIDs[g_windowsVersionIndex].virtualDesktop, (void**)&desktop);
+  return desktop;
+}
+
+bool GetCurrentDesktopId(GUID* outGuid) {
+  if (!g_pDesktopManagerInternal) return false;
+
+  IVirtualDesktop* desktop = nullptr;
+  HRESULT hr = CallManagerInternal(VTABLE_GET_CURRENT_DESKTOP, &desktop);
+  if (FAILED(hr) || !desktop) {
+    Wh_Log(L"GetCurrentDesktop failed: 0x%08X", hr);
+    return false;
+  }
+
+  hr = desktop->GetId(outGuid);
+  desktop->Release();
+  return SUCCEEDED(hr);
+}
+
+// Index of the desktop with |desktopId| in |desktops|, or -1.
+int FindDesktopIndex(IObjectArray* desktops, UINT count, const GUID& desktopId) {
+  for (UINT i = 0; i < count; ++i) {
+    IVirtualDesktop* desktop = GetDesktopByIndex(desktops, i);
+    if (!desktop) continue;
+    GUID guid;
+    bool match = SUCCEEDED(desktop->GetId(&guid)) && IsEqualGUID(guid, desktopId);
+    desktop->Release();
+    if (match) return static_cast<int>(i);
+  }
+  return -1;
+}
+
+bool SwitchToDesktop(IVirtualDesktop* desktop) {
+  HRESULT hr = CallManagerInternalWithArg(VTABLE_SWITCH_DESKTOP, desktop);
+  if (FAILED(hr)) Wh_Log(L"SwitchToDesktop failed: 0x%08X", hr);
+  return SUCCEEDED(hr);
+}
+
+bool MoveViewToDesktop(IApplicationView* view, IVirtualDesktop* desktop) {
+  auto pfn = GetVTableFunction<HRESULT(STDMETHODCALLTYPE*)(void*, IApplicationView*, IVirtualDesktop*)>(
+      g_pDesktopManagerInternal, VTABLE_MOVE_VIEW_TO_DESKTOP);
+  HRESULT hr = pfn(g_pDesktopManagerInternal, view, desktop);
+  if (FAILED(hr)) Wh_Log(L"MoveViewToDesktop failed: 0x%08X", hr);
+  return SUCCEEDED(hr);
+}
+
+void FocusWindow(HWND hwnd) {
+  if (IsIconic(hwnd)) ShowWindow(hwnd, SW_RESTORE);
+  SetForegroundWindow(hwnd);
+}
+
+// Move the active window to the previous (direction = -1) or next (+1) desktop,
+// wrapping around at both ends.
+bool MoveActiveWindowByOffset(int direction) {
+  if (!InitializeVirtualDesktopAPI()) return false;
+
+  HWND hwnd = GetForegroundWindow();
+  if (!hwnd) {
+    Wh_Log(L"No active window to move");
+    return false;
+  }
+
+  GUID currentId = {};
+  if (!GetCurrentDesktopId(&currentId)) return false;
+
+  IObjectArray* desktops = GetDesktops();
+  if (!desktops) return false;
+
+  UINT count = 0;
+  desktops->GetCount(&count);
+  int currentIndex = count ? FindDesktopIndex(desktops, count, currentId) : -1;
+  if (currentIndex < 0) {
+    Wh_Log(L"Current desktop not found among %u desktops", count);
+    desktops->Release();
+    return false;
+  }
+  if (count < 2) {
+    desktops->Release();
+    return true;  // Nothing to move to.
+  }
+
+  int targetIndex = (currentIndex + direction + static_cast<int>(count)) % static_cast<int>(count);
+  IVirtualDesktop* target = GetDesktopByIndex(desktops, targetIndex);
+  desktops->Release();
+  if (!target) {
+    Wh_Log(L"Target desktop %d not found", targetIndex + 1);
+    return false;
+  }
+
+  IApplicationView* view = nullptr;
+  bool success = SUCCEEDED(g_pViewCollection->GetViewForHwnd(hwnd, &view)) && view &&
+                 MoveViewToDesktop(view, target);
+  SAFE_RELEASE(view);
+
+  if (success) {
+    Wh_Log(L"Moved window to desktop %d of %u", targetIndex + 1, count);
+    if (g_followMovedWindow && SwitchToDesktop(target)) {
+      FocusWindow(hwnd);
+    }
+  } else {
+    Wh_Log(L"Could not move the active window (hwnd=0x%p)", hwnd);
+  }
+
+  target->Release();
+  return success;
+}
+
+//=============================================================================
+// Hotkey thread
+//=============================================================================
+
+void RegisterHotkeys(HWND hwnd) {
+  BOOL ok = RegisterHotKey(hwnd, HK_MOVE_PREV, kHotkeyModifiers, VK_LEFT);
+  Wh_Log(L"RegisterHotKey Ctrl+Win+Shift+Left: result=%d, error=%lu", ok, ok ? 0 : GetLastError());
+
+  ok = RegisterHotKey(hwnd, HK_MOVE_NEXT, kHotkeyModifiers, VK_RIGHT);
+  Wh_Log(L"RegisterHotKey Ctrl+Win+Shift+Right: result=%d, error=%lu", ok, ok ? 0 : GetLastError());
+}
+
+void UnregisterHotkeys(HWND hwnd) {
+  UnregisterHotKey(hwnd, HK_MOVE_PREV);
+  UnregisterHotKey(hwnd, HK_MOVE_NEXT);
+}
+
+void HandleHotkey(UINT hotkeyId) {
+  if (!InitializeVirtualDesktopAPI()) {
+    Wh_Log(L"Hotkey ignored: API not initialized");
+    return;
+  }
+
+  if (hotkeyId == HK_MOVE_PREV) {
+    MoveActiveWindowByOffset(-1);
+  } else if (hotkeyId == HK_MOVE_NEXT) {
+    MoveActiveWindowByOffset(+1);
+  }
+}
+
+LRESULT CALLBACK HotkeyWindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam) {
+  if (message == WM_HOTKEY) {
+    if (g_hotkeyThreadRunning) {
+      HandleHotkey(static_cast<UINT>(wParam));
+    }
+    return 0;
+  }
+
+  if (message == WM_APP_SETTINGS_CHANGED) {
+    if (!g_hotkeyThreadRunning) return 0;
+
+    int previousVersionIndex = g_windowsVersionIndex;
+    LoadSettings();
+
+    if (previousVersionIndex != g_windowsVersionIndex) {
+      CleanupVirtualDesktopAPI();
+      if (!InitializeVirtualDesktopAPI()) {
+        Wh_Log(L"Virtual Desktop API failed to initialize after settings change; hotkeys will retry on use");
+      }
+    }
+    return 0;
+  }
+
+  return DefWindowProc(hwnd, message, wParam, lParam);
+}
+
+DWORD WINAPI HotkeyThreadProc(LPVOID) {
+  Wh_Log(L"Hotkey thread started, thread ID: %lu", GetCurrentThreadId());
+
+  HRESULT coHr = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
+  if (FAILED(coHr)) {
+    Wh_Log(L"Hotkey thread COM initialization failed: 0x%08X", coHr);
+    g_hotkeyThreadRunning = false;
+    return 0;
+  }
+
+  HINSTANCE module = GetModuleHandle(nullptr);
+  WNDCLASSEXW windowClass = {
+      .cbSize = sizeof(windowClass),
+      .lpfnWndProc = HotkeyWindowProc,
+      .hInstance = module,
+      .lpszClassName = kHotkeyWindowClassName,
+  };
+
+  if (!RegisterClassExW(&windowClass)) {
+    Wh_Log(L"Failed to register hotkey window class: %lu", GetLastError());
+    CoUninitialize();
+    g_hotkeyThreadRunning = false;
+    return 0;
+  }
+
+  HWND hwnd = CreateWindowExW(0, kHotkeyWindowClassName, nullptr, 0, 0, 0, 0, 0, HWND_MESSAGE, nullptr, module,
+                              nullptr);
+  if (!hwnd) {
+    Wh_Log(L"Failed to create hotkey message window: %lu", GetLastError());
+    UnregisterClassW(kHotkeyWindowClassName, module);
+    CoUninitialize();
+    g_hotkeyThreadRunning = false;
+    return 0;
+  }
+
+  g_hMsgWnd = hwnd;
+
+  if (g_hotkeyThreadRunning) {
+    if (g_settingsReloadPending.exchange(false)) {
+      LoadSettings();
+    }
+    RegisterHotkeys(hwnd);
+    Wh_Log(L"Hotkey thread ready");
+
+    if (!InitializeVirtualDesktopAPI()) {
+      Wh_Log(L"Virtual Desktop API failed to initialize on startup; hotkeys will retry on use");
+    }
+  }
+
+  MSG msg;
+  while (g_hotkeyThreadRunning && GetMessage(&msg, nullptr, 0, 0) > 0) {
+    TranslateMessage(&msg);
+    DispatchMessage(&msg);
+  }
+
+  g_hMsgWnd = nullptr;
+  UnregisterHotkeys(hwnd);
+  CleanupVirtualDesktopAPI();
+  DestroyWindow(hwnd);
+  UnregisterClassW(kHotkeyWindowClassName, module);
+  CoUninitialize();
+
+  g_hotkeyThreadRunning = false;
+  Wh_Log(L"Hotkey thread stopped");
+  return 0;
+}
+
+//=============================================================================
+// Windhawk tool mod entry points
+//=============================================================================
+
+BOOL WhTool_ModInit() {
+  Wh_Log(L"Desktop Window Keys initializing...");
+  LoadSettings();
+  g_settingsReloadPending = false;
+  g_hotkeyThreadRunning = true;
+  g_hThread = CreateThread(nullptr, 0, HotkeyThreadProc, nullptr, 0, nullptr);
+  if (!g_hThread) {
+    g_hotkeyThreadRunning = false;
+    Wh_Log(L"Failed to create hotkey thread: %lu", GetLastError());
+    return FALSE;
+  }
+  return TRUE;
+}
+
+void WhTool_ModUninit() {
+  Wh_Log(L"Desktop Window Keys uninitializing...");
+  g_hotkeyThreadRunning = false;
+  if (HWND hwnd = g_hMsgWnd.load()) {
+    PostMessage(hwnd, WM_QUIT, 0, 0);
+  }
+
+  if (g_hThread) {
+    DWORD waitResult = WaitForSingleObject(g_hThread, 5000);
+    if (waitResult != WAIT_OBJECT_0) {
+      Wh_Log(L"Hotkey thread cleanup did not finish before process exit (wait=%lu)", waitResult);
+    }
+    CloseHandle(g_hThread);
+    g_hThread = nullptr;
+  }
+}
+
+void WhTool_ModSettingsChanged() {
+  if (HWND hwnd = g_hMsgWnd.load()) {
+    PostMessage(hwnd, WM_APP_SETTINGS_CHANGED, 0, 0);
+    return;
+  }
+
+  // The hotkey thread has not created its window yet: it reloads settings on startup.
+  g_settingsReloadPending = true;
+  if (HWND hwnd = g_hMsgWnd.load(); hwnd && g_settingsReloadPending.exchange(false)) {
+    PostMessage(hwnd, WM_APP_SETTINGS_CHANGED, 0, 0);
+  }
+}
+
+////////////////////////////////////////////////////////////////////////////////
+// Windhawk tool mod implementation for mods which don't need to inject to other
+// processes or hook other functions. Context:
+// https://github.com/ramensoftware/windhawk/wiki/Mods-as-tools:-Running-mods-in-a-dedicated-process
+//
+// The mod will load and run in a dedicated windhawk.exe process.
+//
+// Paste the code below as part of the mod code, and use these callbacks:
+// * WhTool_ModInit
+// * WhTool_ModSettingsChanged
+// * WhTool_ModUninit
+//
+// Currently, other callbacks are not supported.
+
+bool g_isToolModProcessLauncher;
+HANDLE g_toolModProcessMutex;
+
+void WINAPI EntryPoint_Hook() {
+  Wh_Log(L">");
+  ExitThread(0);
+}
+
+BOOL Wh_ModInit() {
+  DWORD sessionId;
+  if (ProcessIdToSessionId(GetCurrentProcessId(), &sessionId) && sessionId == 0) {
+    return FALSE;
+  }
+
+  bool isExcluded = false;
+  bool isToolModProcess = false;
+  bool isCurrentToolModProcess = false;
+  int argc;
+  LPWSTR* argv = CommandLineToArgvW(GetCommandLine(), &argc);
+  if (!argv) {
+    Wh_Log(L"CommandLineToArgvW failed");
+    return FALSE;
+  }
+
+  for (int i = 1; i < argc; i++) {
+    if (wcscmp(argv[i], L"-service") == 0 || wcscmp(argv[i], L"-service-start") == 0 ||
+        wcscmp(argv[i], L"-service-stop") == 0) {
+      isExcluded = true;
+      break;
+    }
+  }
+
+  for (int i = 1; i < argc - 1; i++) {
+    if (wcscmp(argv[i], L"-tool-mod") == 0) {
+      isToolModProcess = true;
+      if (wcscmp(argv[i + 1], WH_MOD_ID) == 0) {
+        isCurrentToolModProcess = true;
+      }
+      break;
+    }
+  }
+
+  LocalFree(argv);
+
+  if (isExcluded) {
+    return FALSE;
+  }
+
+  if (isCurrentToolModProcess) {
+    g_toolModProcessMutex = CreateMutex(nullptr, TRUE, L"windhawk-tool-mod_" WH_MOD_ID);
+    if (!g_toolModProcessMutex) {
+      Wh_Log(L"CreateMutex failed");
+      ExitProcess(1);
+    }
+
+    if (GetLastError() == ERROR_ALREADY_EXISTS) {
+      Wh_Log(L"Tool mod already running (%s)", WH_MOD_ID);
+      ExitProcess(1);
+    }
+
+    if (!WhTool_ModInit()) {
+      ExitProcess(1);
+    }
+
+    IMAGE_DOS_HEADER* dosHeader = (IMAGE_DOS_HEADER*)GetModuleHandle(nullptr);
+    IMAGE_NT_HEADERS* ntHeaders = (IMAGE_NT_HEADERS*)((BYTE*)dosHeader + dosHeader->e_lfanew);
+
+    DWORD entryPointRVA = ntHeaders->OptionalHeader.AddressOfEntryPoint;
+    void* entryPoint = (BYTE*)dosHeader + entryPointRVA;
+
+    Wh_SetFunctionHook(entryPoint, (void*)EntryPoint_Hook, nullptr);
+    return TRUE;
+  }
+
+  if (isToolModProcess) {
+    return FALSE;
+  }
+
+  g_isToolModProcessLauncher = true;
+  return TRUE;
+}
+
+void Wh_ModAfterInit() {
+  if (!g_isToolModProcessLauncher) {
+    return;
+  }
+
+  WCHAR currentProcessPath[MAX_PATH];
+  switch (GetModuleFileName(nullptr, currentProcessPath, ARRAYSIZE(currentProcessPath))) {
+    case 0:
+    case ARRAYSIZE(currentProcessPath):
+      Wh_Log(L"GetModuleFileName failed");
+      return;
+  }
+
+  WCHAR
+  commandLine[MAX_PATH + 2 + (sizeof(L" -tool-mod \"" WH_MOD_ID "\"") / sizeof(WCHAR)) - 1];
+  swprintf_s(commandLine, L"\"%s\" -tool-mod \"%s\"", currentProcessPath, WH_MOD_ID);
+
+  HMODULE kernelModule = GetModuleHandle(L"kernelbase.dll");
+  if (!kernelModule) {
+    kernelModule = GetModuleHandle(L"kernel32.dll");
+    if (!kernelModule) {
+      Wh_Log(L"No kernelbase.dll/kernel32.dll");
+      return;
+    }
+  }
+
+  using CreateProcessInternalW_t = BOOL(WINAPI*)(
+      HANDLE hUserToken, LPCWSTR lpApplicationName, LPWSTR lpCommandLine, LPSECURITY_ATTRIBUTES lpProcessAttributes,
+      LPSECURITY_ATTRIBUTES lpThreadAttributes, WINBOOL bInheritHandles, DWORD dwCreationFlags, LPVOID lpEnvironment,
+      LPCWSTR lpCurrentDirectory, LPSTARTUPINFOW lpStartupInfo, LPPROCESS_INFORMATION lpProcessInformation,
+      PHANDLE hRestrictedUserToken);
+  CreateProcessInternalW_t pCreateProcessInternalW =
+      (CreateProcessInternalW_t)GetProcAddress(kernelModule, "CreateProcessInternalW");
+  if (!pCreateProcessInternalW) {
+    Wh_Log(L"No CreateProcessInternalW");
+    return;
+  }
+
+  STARTUPINFO si{
+      .cb = sizeof(STARTUPINFO),
+      .dwFlags = STARTF_FORCEOFFFEEDBACK,
+  };
+  PROCESS_INFORMATION pi;
+  if (!pCreateProcessInternalW(nullptr, currentProcessPath, commandLine, nullptr, nullptr, FALSE, NORMAL_PRIORITY_CLASS,
+                               nullptr, nullptr, &si, &pi, nullptr)) {
+    Wh_Log(L"CreateProcess failed");
+    return;
+  }
+
+  CloseHandle(pi.hProcess);
+  CloseHandle(pi.hThread);
+}
+
+void Wh_ModSettingsChanged() {
+  if (g_isToolModProcessLauncher) {
+    return;
+  }
+
+  WhTool_ModSettingsChanged();
+}
+
+void Wh_ModUninit() {
+  if (g_isToolModProcessLauncher) {
+    return;
+  }
+
+  WhTool_ModUninit();
+  ExitProcess(0);
+}
