@@ -22,5 +22,7 @@ Sanal masaüstleri arasında pencere taşıma ve sabitleme için Windhawk modu (
   var mı bak; yoksa sorun kod değil, sürecin başlamaması. Log için editörde "Enable logging" açık olmalı.
 - Yönetici yetkili pencere öndeyken `SendInput` UIPI ile sessizce düşer (dönüş değeri başarılı);
   Windhawk 1.7.3'te çözümü yok, kod bunu `CanInjectInputTo` ile önceden tespit eder.
+  Aynı engel yönetici penceresine göre `SetWindowPos` (hWndInsertAfter) ve `DwmSetWindowAttribute`
+  için de geçerli (`ERROR_ACCESS_DENIED`). Windhawk editörü (VSCodium) yönetici yetkilidir, testte bunu hesaba kat.
 - Vault: istekler `C:/Users/demir/Obsidian/Obsidian Vault/Projects/desktop-window-keys/requests/`,
   proje kartı `knowledge/projects/desktop-window-keys.md`. İş seçmek için `/brifing`.
