@@ -4,6 +4,8 @@
 // @description     Move the active window between virtual desktops (Ctrl+Win+Shift+Left/Right) and pin it to all desktops (Up/Down)
 // @version         0.3.0
 // @author          Anqarium
+// @github          https://github.com/Anqarium
+// @homepage        https://github.com/Anqarium/desktop-window-keys
 // @include         windhawk.exe
 // @include         windhawk-mod.exe
 // @include         windhawk-mod-uiaccess.exe
