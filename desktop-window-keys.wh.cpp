@@ -2,7 +2,7 @@
 // @id              desktop-window-keys
 // @name            Desktop Window Keys
 // @description     Move the active window to the previous/next virtual desktop with Ctrl+Win+Shift+Left/Right
-// @version         0.1.0
+// @version         0.1.2
 // @author          Anqarium
 // @include         windhawk.exe
 // @compilerOptions -lole32 -loleaut32 -luuid
@@ -23,7 +23,10 @@ Moving wraps around: Right on the last desktop goes to the first one, Left on th
 first desktop goes to the last one (same as the Virtual Desktop Hotkey Cycle mod).
 
 With **Follow Moved Window** enabled you switch to the target desktop together with
-the window; otherwise only the window moves and you stay where you are.
+the window; otherwise only the window moves and you stay where you are. When following
+a wrap, the switch goes through Explorer's own Win+Ctrl+Left/Right so the slide
+animation keeps the pressed direction; this needs Virtual Desktop Hotkey Cycle to be
+enabled, otherwise the switch falls back to a slide in the opposite direction.
 
 If another program already owns a hotkey, the registration failure is written to the
 Windhawk log.
@@ -94,33 +97,40 @@ static const IID IID_IApplicationViewCollection = {
 // Microsoft changes these IIDs between Windows builds. usesHMonitor: some builds
 // take an HMONITOR as the first argument of the manager methods.
 // Source: Virtual Desktop Helper v2.5.0 (u2x1), VirtualDesktopAccessor.
+// switchWithAnimationIndex: VTable index of SwitchDesktopWithAnimation, or -1 when
+// unknown for that build (plain SwitchDesktop is used, which skips the animation).
+// 24H2 (26100+) layout from MScholtes/VirtualDesktop VirtualDesktop11-24H2.cs (a725cbd)
+// and VirtualDesktopAccessor (ceb6488): SwitchDesktopAndMoveForegroundView sits at 10,
+// so SwitchDesktopWithAnimation is at 22. Do not guess indices for other builds: a
+// wrong slot calls an unrelated method with mismatched arguments.
 struct VersionIIDs {
   IID managerInternal;  // IVirtualDesktopManagerInternal
   IID virtualDesktop;   // IVirtualDesktop
   bool usesHMonitor;
+  int switchWithAnimationIndex;
 };
 
 static const VersionIIDs g_versionIIDs[] = {
     // [0] Windows 10 (Build < 20348)
     {{0xF31574D6, 0xB682, 0x4CDC, {0xBD, 0x56, 0x18, 0x27, 0x86, 0x0A, 0xBE, 0xC6}},
      {0xFF72FFDD, 0xBE7E, 0x43FC, {0x9C, 0x03, 0xAD, 0x81, 0x68, 0x1E, 0x88, 0xE4}},
-     false},
+     false, -1},
     // [1] Windows 10 (Build 20348 - 21999)
     {{0x094AFE11, 0x44F2, 0x4BA0, {0x97, 0x6F, 0x29, 0xA9, 0x7E, 0x26, 0x3E, 0xE0}},
      {0x62FDF88B, 0x11CA, 0x4AFB, {0x8B, 0xD8, 0x22, 0x96, 0xDF, 0xAE, 0x49, 0xE2}},
-     true},
+     true, -1},
     // [2] Windows 11 (Build 22000 - 22482)
     {{0xB2F925B9, 0x5A0F, 0x4D2E, {0x9F, 0x4D, 0x2B, 0x15, 0x07, 0x59, 0x3C, 0x10}},
      {0x536D3495, 0xB208, 0x4CC9, {0xAE, 0x26, 0xDE, 0x81, 0x11, 0x27, 0x5B, 0xF8}},
-     true},
+     true, -1},
     // [3] Windows 11 (Build 22621/22631/23H2)
     {{0xA3175F2D, 0x239C, 0x4BD2, {0x8A, 0xA0, 0xEE, 0xBA, 0x8B, 0x0B, 0x13, 0x8E}},
      {0x3F07F4BE, 0xB107, 0x441A, {0xAF, 0x0F, 0x39, 0xD8, 0x25, 0x29, 0x07, 0x2C}},
-     false},
+     false, -1},
     // [4] Windows 11 (Build 26100+ / 24H2)
     {{0x53F5CA0B, 0x158F, 0x4124, {0x90, 0x0C, 0x05, 0x71, 0x58, 0x06, 0x0B, 0x27}},
      {0x3F07F4BE, 0xB107, 0x441A, {0xAF, 0x0F, 0x39, 0xD8, 0x25, 0x29, 0x07, 0x2C}},
-     false},
+     false, 22},
 };
 
 // Default to Windows 11 24H2.
@@ -363,8 +373,10 @@ int FindDesktopIndex(IObjectArray* desktops, UINT count, const GUID& desktopId) 
   return -1;
 }
 
+// Switches with the system slide animation when the build's VTable slot is known.
 bool SwitchToDesktop(IVirtualDesktop* desktop) {
-  HRESULT hr = CallManagerInternalWithArg(VTABLE_SWITCH_DESKTOP, desktop);
+  int animationIndex = g_versionIIDs[g_windowsVersionIndex].switchWithAnimationIndex;
+  HRESULT hr = CallManagerInternalWithArg(animationIndex >= 0 ? animationIndex : VTABLE_SWITCH_DESKTOP, desktop);
   if (FAILED(hr)) Wh_Log(L"SwitchToDesktop failed: 0x%08X", hr);
   return SUCCEEDED(hr);
 }
@@ -375,6 +387,56 @@ bool MoveViewToDesktop(IApplicationView* view, IVirtualDesktop* desktop) {
   HRESULT hr = pfn(g_pDesktopManagerInternal, view, desktop);
   if (FAILED(hr)) Wh_Log(L"MoveViewToDesktop failed: 0x%08X", hr);
   return SUCCEEDED(hr);
+}
+
+// Explorer's own Win+Ctrl+Left/Right slides in the pressed direction, while COM's
+// SwitchDesktopWithAnimation picks the direction from the desktop indices, so a wrap
+// (last -> first) would slide left. For wraps we therefore inject the native shortcut;
+// Explorer wraps it only when the Virtual Desktop Hotkey Cycle mod (or similar) is
+// active. Returns true once the current desktop became |targetId|.
+bool SwitchByNativeShortcut(int direction, const GUID& targetId) {
+  auto isDown = [](int vk) { return (GetAsyncKeyState(vk) & 0x8000) != 0; };
+  bool lShift = isDown(VK_LSHIFT), rShift = isDown(VK_RSHIFT);
+  bool ctrl = isDown(VK_CONTROL);
+  bool win = isDown(VK_LWIN) || isDown(VK_RWIN);
+
+  INPUT inputs[10] = {};
+  UINT n = 0;
+  auto key = [&](WORD vk, bool up, bool extended = false) {
+    inputs[n].type = INPUT_KEYBOARD;
+    inputs[n].ki.wVk = vk;
+    inputs[n].ki.dwFlags = (up ? KEYEVENTF_KEYUP : 0) | (extended ? KEYEVENTF_EXTENDEDKEY : 0);
+    ++n;
+  };
+
+  // Our hotkey is still held: release Shift so the arrow reaches Explorer as
+  // Win+Ctrl+Arrow instead of re-triggering Ctrl+Win+Shift+Arrow, then restore it so
+  // the next press while holding the modifiers moves a window again.
+  if (lShift) key(VK_LSHIFT, true);
+  if (rShift) key(VK_RSHIFT, true);
+  if (!ctrl) key(VK_LCONTROL, false);
+  if (!win) key(VK_LWIN, false);
+  WORD arrow = direction > 0 ? VK_RIGHT : VK_LEFT;
+  key(arrow, false, true);
+  key(arrow, true, true);
+  if (!win) key(VK_LWIN, true);
+  if (!ctrl) key(VK_LCONTROL, true);
+  if (lShift) key(VK_LSHIFT, false);
+  if (rShift) key(VK_RSHIFT, false);
+
+  if (SendInput(n, inputs, sizeof(INPUT)) != n) {
+    Wh_Log(L"SendInput failed: %lu", GetLastError());
+    return false;
+  }
+
+  // Explorer handles the shortcut asynchronously; wait briefly for the switch.
+  for (int i = 0; i < 20; ++i) {
+    Sleep(15);
+    GUID currentId;
+    if (GetCurrentDesktopId(&currentId) && IsEqualGUID(currentId, targetId)) return true;
+  }
+  Wh_Log(L"Native shortcut did not wrap (Virtual Desktop Hotkey Cycle not active?)");
+  return false;
 }
 
 void FocusWindow(HWND hwnd) {
@@ -427,8 +489,14 @@ bool MoveActiveWindowByOffset(int direction) {
 
   if (success) {
     Wh_Log(L"Moved window to desktop %d of %u", targetIndex + 1, count);
-    if (g_followMovedWindow && SwitchToDesktop(target)) {
-      FocusWindow(hwnd);
+    if (g_followMovedWindow) {
+      bool wrapped = direction > 0 ? targetIndex == 0 : targetIndex == static_cast<int>(count) - 1;
+      GUID targetId = {};
+      bool switched = wrapped && SUCCEEDED(target->GetId(&targetId)) &&
+                      SwitchByNativeShortcut(direction, targetId);
+      if (switched || SwitchToDesktop(target)) {
+        FocusWindow(hwnd);
+      }
     }
   } else {
     Wh_Log(L"Could not move the active window (hwnd=0x%p)", hwnd);
