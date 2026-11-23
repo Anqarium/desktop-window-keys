@@ -2,7 +2,7 @@
 // @id              desktop-window-keys
 // @name            Desktop Window Keys
 // @description     Move the active window between virtual desktops (Ctrl+Win+Shift+Left/Right) and pin it to all desktops (Up/Down)
-// @version         0.2.0
+// @version         0.2.1
 // @author          Anqarium
 // @include         windhawk.exe
 // @include         windhawk-mod.exe
@@ -62,7 +62,8 @@ by u2x1 (v2.5.0), itself based on
     - win10_old: Windows 10 (Build < 20348)
     - win10_20348: Windows 10 (Build 20348 - 21999)
     - win11_22000: Windows 11 (Build 22000 - 22482)
-    - win11_22621: Windows 11 (Build 22621/22631/23H2)
+    - win11_22621: Windows 11 (Build 22621/22631 before .3085)
+    - win11_22631_3085: Windows 11 (Build 22621/22631 from .3085 / current 23H2)
     - win11_26100: Windows 11 (Build 26100+ / 24H2)
 
 - FollowMovedWindow: false
@@ -123,6 +124,10 @@ static const IID IID_IVirtualDesktopPinnedApps = {
 // and VirtualDesktopAccessor (ceb6488): SwitchDesktopAndMoveForegroundView sits at 10,
 // so SwitchDesktopWithAnimation is at 22. Do not guess indices for other builds: a
 // wrong slot calls an unrelated method with mismatched arguments.
+// 22621/22631 from .3085 (entry [5]) shares the 24H2 IIDs but has no
+// SwitchDesktopAndMoveForegroundView, so SwitchDesktopWithAnimation is at 21
+// (MScholtes/VirtualDesktop VirtualDesktop11.cs, a725cbd; slot counted from the
+// interface declaration, IUnknown occupies 0-2). Not yet tried on a real 23H2 machine.
 struct VersionIIDs {
   IID managerInternal;  // IVirtualDesktopManagerInternal
   IID virtualDesktop;   // IVirtualDesktop
@@ -143,7 +148,7 @@ static const VersionIIDs g_versionIIDs[] = {
     {{0xB2F925B9, 0x5A0F, 0x4D2E, {0x9F, 0x4D, 0x2B, 0x15, 0x07, 0x59, 0x3C, 0x10}},
      {0x536D3495, 0xB208, 0x4CC9, {0xAE, 0x26, 0xDE, 0x81, 0x11, 0x27, 0x5B, 0xF8}},
      true, -1},
-    // [3] Windows 11 (Build 22621/22631/23H2)
+    // [3] Windows 11 (Build 22621/22631 before .3085)
     {{0xA3175F2D, 0x239C, 0x4BD2, {0x8A, 0xA0, 0xEE, 0xBA, 0x8B, 0x0B, 0x13, 0x8E}},
      {0x3F07F4BE, 0xB107, 0x441A, {0xAF, 0x0F, 0x39, 0xD8, 0x25, 0x29, 0x07, 0x2C}},
      false, -1},
@@ -151,6 +156,10 @@ static const VersionIIDs g_versionIIDs[] = {
     {{0x53F5CA0B, 0x158F, 0x4124, {0x90, 0x0C, 0x05, 0x71, 0x58, 0x06, 0x0B, 0x27}},
      {0x3F07F4BE, 0xB107, 0x441A, {0xAF, 0x0F, 0x39, 0xD8, 0x25, 0x29, 0x07, 0x2C}},
      false, 22},
+    // [5] Windows 11 (Build 22621/22631 from .3085, current 23H2)
+    {{0x53F5CA0B, 0x158F, 0x4124, {0x90, 0x0C, 0x05, 0x71, 0x58, 0x06, 0x0B, 0x27}},
+     {0x3F07F4BE, 0xB107, 0x441A, {0xAF, 0x0F, 0x39, 0xD8, 0x25, 0x29, 0x07, 0x2C}},
+     false, 21},
 };
 
 // Default to Windows 11 24H2.
@@ -238,7 +247,8 @@ int ParseWindowsVersion(PCWSTR str) {
     PCWSTR name;
     int index;
   } kVersionMap[] = {
-      {L"win10_old", 0}, {L"win10_20348", 1}, {L"win11_22000", 2}, {L"win11_22621", 3}, {L"win11_26100", 4}};
+      {L"win10_old", 0}, {L"win10_20348", 1}, {L"win11_22000", 2}, {L"win11_22621", 3}, {L"win11_26100", 4},
+      {L"win11_22631_3085", 5}};
   for (const auto& entry : kVersionMap) {
     if (str && wcscmp(str, entry.name) == 0) return entry.index;
   }
