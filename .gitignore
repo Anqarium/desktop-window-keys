@@ -71,3 +71,6 @@ Testing/
 .env
 .env.*
 .claude/settings.local.json
+
+# Claude Code project instructions (kept local, repo is public)
+CLAUDE.md
