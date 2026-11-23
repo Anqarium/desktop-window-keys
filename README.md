@@ -20,6 +20,10 @@ komşu masaüstüne taşır ve pencereyi tüm masaüstlerine sabitler.
   Hotkey Cycle yapar. Öndeki pencere yönetici yetkiliyse Windows (UIPI) enjeksiyonu engeller;
   bu durumda COM geçişi kullanılır ve animasyon ters yöne kayar. Windhawk 1.7.3'te çözümü
   yok; 2.0'ın UIAccess süreci (`@include windhawk-mod-uiaccess.exe`, alpha'da) bunu kaldırır.
+- **Sabitleme durum atar, değiştirmez (toggle değil):** Üst her zaman sabitler, Alt her zaman
+  kaldırır; zaten o durumdaki pencerede bir şey yapmaz. Sabitleme `IVirtualDesktopPinnedApps`
+  (`PinView`/`UnpinView`) ile yapılır; IID'si Windows sürümüne göre değişmez, servis alınamazsa
+  yalnız sabitleme kısayolları devre dışı kalır, taşıma çalışır.
 - Kısayollar sabit: modun kaynak aldığı modeldeki Alt tabanlı varsayılanlar kullanılmaz. Bir
   kısayol başka bir uygulama tarafından kullanılıyorsa kayıt başarısızlığı loglanır.
 - Windows'ta bu işlemlerin yerleşik karşılığı yalnızca Görev Görünümü'ndeki (Win+Tab) sağ tık

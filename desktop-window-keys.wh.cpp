@@ -1,8 +1,8 @@
 // ==WindhawkMod==
 // @id              desktop-window-keys
 // @name            Desktop Window Keys
-// @description     Move the active window to the previous/next virtual desktop with Ctrl+Win+Shift+Left/Right
-// @version         0.1.4
+// @description     Move the active window between virtual desktops (Ctrl+Win+Shift+Left/Right) and pin it to all desktops (Up/Down)
+// @version         0.2.0
 // @author          Anqarium
 // @include         windhawk.exe
 // @include         windhawk-mod.exe
@@ -14,12 +14,17 @@
 /*
 # Desktop Window Keys
 
-Moves the active window between virtual desktops with the keyboard.
+Moves the active window between virtual desktops and pins it to all desktops with the keyboard.
 
 | Hotkey | Action |
 |---|---|
 | `Ctrl+Win+Shift+Left` | Move the active window to the previous desktop |
 | `Ctrl+Win+Shift+Right` | Move the active window to the next desktop |
+| `Ctrl+Win+Shift+Up` | Pin the active window to all desktops |
+| `Ctrl+Win+Shift+Down` | Unpin the active window |
+
+Pinning is the same as "Show this window on all desktops" in Task View (Win+Tab).
+Up and Down only set the state, so pressing Up twice keeps the window pinned.
 
 Moving wraps around: Right on the last desktop goes to the first one, Left on the
 first desktop goes to the last one (same as the Virtual Desktop Hotkey Cycle mod).
@@ -99,6 +104,16 @@ static const CLSID CLSID_VirtualDesktopManagerInternal = {
 static const IID IID_IApplicationViewCollection = {
     0x1841C6D7, 0x4F9D, 0x42C0, {0xAF, 0x41, 0x87, 0x47, 0x53, 0x8F, 0x10, 0xE5}};
 
+// CLSID_VirtualDesktopPinnedApps: {B5A399E7-1C87-46B8-88E9-FC5747B171BD}
+// Same value on every supported build (Virtual Desktop Helper v2.5.0 uses one constant).
+static const CLSID CLSID_VirtualDesktopPinnedApps = {
+    0xB5A399E7, 0x1C87, 0x46B8, {0x88, 0xE9, 0xFC, 0x57, 0x47, 0xB1, 0x71, 0xBD}};
+
+// IID_IVirtualDesktopPinnedApps: {4CE81583-1E4C-4632-A621-07A53543148F}
+// Explicit constant: MinGW does not emit __uuidof for MIDL_INTERFACE (link error).
+static const IID IID_IVirtualDesktopPinnedApps = {
+    0x4CE81583, 0x1E4C, 0x4632, {0xA6, 0x21, 0x07, 0xA5, 0x35, 0x43, 0x14, 0x8F}};
+
 // Microsoft changes these IIDs between Windows builds. usesHMonitor: some builds
 // take an HMONITOR as the first argument of the manager methods.
 // Source: Virtual Desktop Helper v2.5.0 (u2x1), VirtualDesktopAccessor.
@@ -161,6 +176,17 @@ IApplicationViewCollection : public IUnknown {
 
 struct IVirtualDesktopManagerInternal : public IUnknown {};
 
+// VTable layout from Virtual Desktop Helper.
+MIDL_INTERFACE("4CE81583-1E4C-4632-A621-07A53543148F")
+IVirtualDesktopPinnedApps : public IUnknown {
+  virtual HRESULT STDMETHODCALLTYPE IsAppIdPinned(LPCWSTR, BOOL*) = 0;
+  virtual HRESULT STDMETHODCALLTYPE PinAppID(LPCWSTR) = 0;
+  virtual HRESULT STDMETHODCALLTYPE UnpinAppID(LPCWSTR) = 0;
+  virtual HRESULT STDMETHODCALLTYPE IsViewPinned(IApplicationView*, BOOL*) = 0;
+  virtual HRESULT STDMETHODCALLTYPE PinView(IApplicationView*) = 0;
+  virtual HRESULT STDMETHODCALLTYPE UnpinView(IApplicationView*) = 0;
+};
+
 // IVirtualDesktopManagerInternal VTable indices (IUnknown occupies 0-2).
 static const int VTABLE_MOVE_VIEW_TO_DESKTOP = 4;
 static const int VTABLE_GET_CURRENT_DESKTOP = 6;
@@ -174,6 +200,7 @@ static const int VTABLE_SWITCH_DESKTOP = 9;
 static IServiceProvider* g_pServiceProvider = nullptr;
 static IVirtualDesktopManagerInternal* g_pDesktopManagerInternal = nullptr;
 static IApplicationViewCollection* g_pViewCollection = nullptr;
+static IVirtualDesktopPinnedApps* g_pPinnedApps = nullptr;  // optional: pin hotkeys only
 static bool g_bInitialized = false;
 
 static HANDLE g_hThread = nullptr;
@@ -186,7 +213,7 @@ static constexpr wchar_t kHotkeyWindowClassName[] = L"WindhawkDesktopWindowKeysH
 
 static bool g_followMovedWindow = false;
 
-enum HotkeyIds { HK_MOVE_PREV = 1, HK_MOVE_NEXT = 2 };
+enum HotkeyIds { HK_MOVE_PREV = 1, HK_MOVE_NEXT = 2, HK_PIN = 3, HK_UNPIN = 4 };
 
 // Ctrl+Win+Shift, fixed by design (see README).
 static constexpr UINT kHotkeyModifiers = MOD_CONTROL | MOD_WIN | MOD_SHIFT | MOD_NOREPEAT;
@@ -257,6 +284,14 @@ bool InitializeVirtualDesktopAPIOnce() {
     return false;
   }
 
+  // Optional: moving windows keeps working when only the pin service is missing.
+  hr = g_pServiceProvider->QueryService(CLSID_VirtualDesktopPinnedApps, IID_IVirtualDesktopPinnedApps,
+                                        (void**)&g_pPinnedApps);
+  if (FAILED(hr)) {
+    Wh_Log(L"PinnedApps service not available (pin hotkeys disabled): 0x%08X", hr);
+    g_pPinnedApps = nullptr;
+  }
+
   return true;
 }
 
@@ -274,6 +309,7 @@ void CleanupVirtualDesktopAPI() {
   HWND hShell = GetShellWindow();
   if (!hShell || !IsWindow(hShell)) {
     Wh_Log(L"Explorer not available, skipping COM cleanup to avoid hang");
+    g_pPinnedApps = nullptr;
     g_pViewCollection = nullptr;
     g_pDesktopManagerInternal = nullptr;
     g_pServiceProvider = nullptr;
@@ -281,6 +317,7 @@ void CleanupVirtualDesktopAPI() {
     return;
   }
 
+  SAFE_RELEASE(g_pPinnedApps);
   SAFE_RELEASE(g_pViewCollection);
   SAFE_RELEASE(g_pDesktopManagerInternal);
   SAFE_RELEASE(g_pServiceProvider);
@@ -552,6 +589,42 @@ bool MoveActiveWindowByOffset(int direction) {
   return success;
 }
 
+// Pin the active window to all desktops (|pin| = true) or unpin it. Sets the state
+// instead of toggling, so each hotkey has one predictable result.
+bool SetActiveWindowPinned(bool pin) {
+  if (!InitializeVirtualDesktopAPI()) return false;
+  if (!g_pPinnedApps) {
+    Wh_Log(L"Pin service not available");
+    return false;
+  }
+
+  HWND hwnd = GetForegroundWindow();
+  if (!hwnd) {
+    Wh_Log(L"No active window to %s", pin ? L"pin" : L"unpin");
+    return false;
+  }
+
+  IApplicationView* view = nullptr;
+  if (FAILED(g_pViewCollection->GetViewForHwnd(hwnd, &view)) || !view) {
+    Wh_Log(L"No application view for the active window (hwnd=0x%p)", hwnd);
+    return false;
+  }
+
+  BOOL isPinned = FALSE;
+  HRESULT hr = g_pPinnedApps->IsViewPinned(view, &isPinned);
+  if (SUCCEEDED(hr) && (isPinned != FALSE) != pin) {
+    hr = pin ? g_pPinnedApps->PinView(view) : g_pPinnedApps->UnpinView(view);
+  }
+  view->Release();
+
+  if (FAILED(hr)) {
+    Wh_Log(L"Failed to %s window: 0x%08X", pin ? L"pin" : L"unpin", hr);
+    return false;
+  }
+  Wh_Log(L"Window %s", pin ? L"pinned" : L"unpinned");
+  return true;
+}
+
 //=============================================================================
 // Hotkey thread
 //=============================================================================
@@ -562,11 +635,19 @@ void RegisterHotkeys(HWND hwnd) {
 
   ok = RegisterHotKey(hwnd, HK_MOVE_NEXT, kHotkeyModifiers, VK_RIGHT);
   Wh_Log(L"RegisterHotKey Ctrl+Win+Shift+Right: result=%d, error=%lu", ok, ok ? 0 : GetLastError());
+
+  ok = RegisterHotKey(hwnd, HK_PIN, kHotkeyModifiers, VK_UP);
+  Wh_Log(L"RegisterHotKey Ctrl+Win+Shift+Up: result=%d, error=%lu", ok, ok ? 0 : GetLastError());
+
+  ok = RegisterHotKey(hwnd, HK_UNPIN, kHotkeyModifiers, VK_DOWN);
+  Wh_Log(L"RegisterHotKey Ctrl+Win+Shift+Down: result=%d, error=%lu", ok, ok ? 0 : GetLastError());
 }
 
 void UnregisterHotkeys(HWND hwnd) {
   UnregisterHotKey(hwnd, HK_MOVE_PREV);
   UnregisterHotKey(hwnd, HK_MOVE_NEXT);
+  UnregisterHotKey(hwnd, HK_PIN);
+  UnregisterHotKey(hwnd, HK_UNPIN);
 }
 
 void HandleHotkey(UINT hotkeyId) {
@@ -579,6 +660,10 @@ void HandleHotkey(UINT hotkeyId) {
     MoveActiveWindowByOffset(-1);
   } else if (hotkeyId == HK_MOVE_NEXT) {
     MoveActiveWindowByOffset(+1);
+  } else if (hotkeyId == HK_PIN) {
+    SetActiveWindowPinned(true);
+  } else if (hotkeyId == HK_UNPIN) {
+    SetActiveWindowPinned(false);
   }
 }
 
