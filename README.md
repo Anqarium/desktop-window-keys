@@ -15,6 +15,11 @@ komşu masaüstüne taşır ve pencereyi tüm masaüstlerine sabitler.
   modu Win+Ctrl+Sol/Sağ geçişini de böyle döndürür; ikisi tutarlı kalır.
 - **Ayar: "Taşınan pencereyi takip et".** İşaretliyse pencereyle birlikte hedef masaüstüne
   geçilir. İşaretli değilse yalnız pencere gider, kullanıcı bulunduğu masaüstünde kalır.
+- **Kenarda animasyon yönü:** Takip açıkken kenardan dönüşte geçiş Explorer'ın Win+Ctrl+Ok
+  kısayolu enjekte edilerek yapılır; animasyon basılan yöne kayar, döngüyü Virtual Desktop
+  Hotkey Cycle yapar. Öndeki pencere yönetici yetkiliyse Windows (UIPI) enjeksiyonu engeller;
+  bu durumda COM geçişi kullanılır ve animasyon ters yöne kayar. Windhawk 1.7.3'te çözümü
+  yok; 2.0'ın UIAccess süreci (`@include windhawk-mod-uiaccess.exe`, alpha'da) bunu kaldırır.
 - Kısayollar sabit: modun kaynak aldığı modeldeki Alt tabanlı varsayılanlar kullanılmaz. Bir
   kısayol başka bir uygulama tarafından kullanılıyorsa kayıt başarısızlığı loglanır.
 - Windows'ta bu işlemlerin yerleşik karşılığı yalnızca Görev Görünümü'ndeki (Win+Tab) sağ tık

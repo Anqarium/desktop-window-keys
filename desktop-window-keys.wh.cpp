@@ -2,9 +2,11 @@
 // @id              desktop-window-keys
 // @name            Desktop Window Keys
 // @description     Move the active window to the previous/next virtual desktop with Ctrl+Win+Shift+Left/Right
-// @version         0.1.2
+// @version         0.1.4
 // @author          Anqarium
 // @include         windhawk.exe
+// @include         windhawk-mod.exe
+// @include         windhawk-mod-uiaccess.exe
 // @compilerOptions -lole32 -loleaut32 -luuid
 // ==/WindhawkMod==
 
@@ -27,6 +29,9 @@ the window; otherwise only the window moves and you stay where you are. When fol
 a wrap, the switch goes through Explorer's own Win+Ctrl+Left/Right so the slide
 animation keeps the pressed direction; this needs Virtual Desktop Hotkey Cycle to be
 enabled, otherwise the switch falls back to a slide in the opposite direction.
+Windows blocks injected keys to elevated (administrator) windows unless the mod runs
+with UIAccess, which Windhawk 2.0 provides through the `windhawk-mod-uiaccess.exe`
+host; on Windhawk 1.7.3 a wrap from an elevated window slides the opposite way.
 
 If another program already owns a hotkey, the registration failure is written to the
 Windhawk log.
@@ -389,6 +394,43 @@ bool MoveViewToDesktop(IApplicationView* view, IVirtualDesktop* desktop) {
   return SUCCEEDED(hr);
 }
 
+// Integrity level of a process token, or -1 when it cannot be read.
+static DWORD GetTokenIntegrity(HANDLE token) {
+  BYTE buffer[TOKEN_INTEGRITY_LEVEL_MAX_SIZE];
+  DWORD size = 0;
+  if (!GetTokenInformation(token, TokenIntegrityLevel, buffer, sizeof(buffer), &size)) return (DWORD)-1;
+  PSID sid = reinterpret_cast<TOKEN_MANDATORY_LABEL*>(buffer)->Label.Sid;
+  return *GetSidSubAuthority(sid, *GetSidSubAuthorityCount(sid) - 1);
+}
+
+// UIPI silently drops injected input aimed at a window of a higher integrity level
+// (e.g. an elevated app) unless this process has UIAccess. SendInput still reports
+// success, so check up front instead of waiting for a switch that never happens.
+// A process whose token cannot be read is treated as higher (typically elevated).
+bool CanInjectInputTo(HWND hwnd) {
+  HANDLE ownToken = nullptr;
+  if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &ownToken)) return true;
+  DWORD uiAccess = 0, size = 0;
+  GetTokenInformation(ownToken, TokenUIAccess, &uiAccess, sizeof(uiAccess), &size);
+  DWORD ownIntegrity = GetTokenIntegrity(ownToken);
+  CloseHandle(ownToken);
+  if (uiAccess) return true;
+
+  DWORD pid = 0;
+  GetWindowThreadProcessId(hwnd, &pid);
+  HANDLE process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+  if (!process) return false;
+  HANDLE token = nullptr;
+  bool canInject = false;
+  if (OpenProcessToken(process, TOKEN_QUERY, &token)) {
+    DWORD integrity = GetTokenIntegrity(token);
+    canInject = integrity != (DWORD)-1 && integrity <= ownIntegrity;
+    CloseHandle(token);
+  }
+  CloseHandle(process);
+  return canInject;
+}
+
 // Explorer's own Win+Ctrl+Left/Right slides in the pressed direction, while COM's
 // SwitchDesktopWithAnimation picks the direction from the desktop indices, so a wrap
 // (last -> first) would slide left. For wraps we therefore inject the native shortcut;
@@ -492,7 +534,11 @@ bool MoveActiveWindowByOffset(int direction) {
     if (g_followMovedWindow) {
       bool wrapped = direction > 0 ? targetIndex == 0 : targetIndex == static_cast<int>(count) - 1;
       GUID targetId = {};
-      bool switched = wrapped && SUCCEEDED(target->GetId(&targetId)) &&
+      bool injectable = wrapped && CanInjectInputTo(hwnd);
+      if (wrapped && !injectable) {
+        Wh_Log(L"Active window has a higher integrity level; wrap slides the opposite way");
+      }
+      bool switched = injectable && SUCCEEDED(target->GetId(&targetId)) &&
                       SwitchByNativeShortcut(direction, targetId);
       if (switched || SwitchToDesktop(target)) {
         FocusWindow(hwnd);
