@@ -34,9 +34,13 @@ komşu masaüstüne taşır ve pencereyi tüm masaüstlerine sabitler.
   - Kenarlık rengi (`DWMWA_BORDER_COLOR`) denendi, bırakıldı: büyütülmüş ve tam ekran pencerede
     kenarlık görünmüyor, yönetici pencerelerinde de UIPI çağrıyı reddediyor.
   - Yalnız Görev Görünümü'nden sabitlenen pencereler rozet almaz.
+  - Sabit pencereyi Sol/Sağ ile taşımak sabitlemeyi kaldırır: Windows `MoveViewToDesktop`'ta
+    pencereyi tek masaüstüne bağlar. Rozet de taşıma anında kalkar. Hedef gizlendiğinde
+    (`DWMWA_CLOAKED`, `EVENT_OBJECT_CLOAKED`) rozet hemen gizlenir.
   - Yönetici yetkili pencerenin (ör. Windhawk editörü) yanına Z sırasında yerleştirme UIPI
-    yüzünden `ERROR_ACCESS_DENIED` verir. O pencerede rozet yalnız pencere öndeyken
-    `HWND_TOPMOST` olarak görünür, öbür zamanlar gizlenir.
+    yüzünden `ERROR_ACCESS_DENIED` verir. O pencerede rozet `WS_EX_TOPMOST` ile yeniden
+    oluşturulur, yalnız pencere öndeyken görünür, öbür zamanlar gizlenir. Topmost oluşturma
+    anında verilmeli: sonradan `SetWindowPos(HWND_TOPMOST)` başarılı döner ama sessizce yok sayılır.
 - Kısayollar sabit: modun kaynak aldığı modeldeki Alt tabanlı varsayılanlar kullanılmaz. Bir
   kısayol başka bir uygulama tarafından kullanılıyorsa kayıt başarısızlığı loglanır.
 - Windows'ta bu işlemlerin yerleşik karşılığı yalnızca Görev Görünümü'ndeki (Win+Tab) sağ tık

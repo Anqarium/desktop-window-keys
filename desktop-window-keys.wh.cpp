@@ -559,6 +559,8 @@ void FocusWindow(HWND hwnd) {
 
 // Move the active window to the previous (direction = -1) or next (+1) desktop,
 // wrapping around at both ends.
+void RemoveBadge(HWND target);
+
 bool MoveActiveWindowByOffset(int direction) {
   if (!InitializeVirtualDesktopAPI()) return false;
 
@@ -602,6 +604,7 @@ bool MoveActiveWindowByOffset(int direction) {
 
   if (success) {
     Wh_Log(L"Moved window to desktop %d of %u", targetIndex + 1, count);
+    RemoveBadge(hwnd);  // moving to one desktop unpins the window
     if (g_followMovedWindow) {
       bool wrapped = direction > 0 ? targetIndex == 0 : targetIndex == static_cast<int>(count) - 1;
       GUID targetId = {};
@@ -657,8 +660,25 @@ PinBadge* FindBadge(HWND target) {
   return nullptr;
 }
 
+// Topmost must be set at creation: SetWindowPos(HWND_TOPMOST) on this window returns
+// success but is silently ignored (verified with a test window).
+HWND CreateBadgeWindow(bool topmost) {
+  DWORD exStyle = WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE;
+  if (topmost) exStyle |= WS_EX_TOPMOST;
+  HWND badgeWnd = CreateWindowExW(exStyle, kBadgeWindowClassName, nullptr, WS_POPUP, 0, 0, 0, 0, nullptr, nullptr,
+                                  GetModuleHandle(nullptr), nullptr);
+  if (!badgeWnd) {
+    Wh_Log(L"Failed to create pin badge: %lu", GetLastError());
+    return nullptr;
+  }
+  SetLayeredWindowAttributes(badgeWnd, 0, kBadgeAlpha, LWA_ALPHA);
+  return badgeWnd;
+}
+
 void UpdateBadge(PinBadge& badge) {
-  if (IsIconic(badge.target) || !IsWindowVisible(badge.target)) {
+  DWORD cloaked = 0;  // e.g. the window was moved to another desktop
+  DwmGetWindowAttribute(badge.target, DWMWA_CLOAKED, &cloaked, sizeof(cloaked));
+  if (cloaked || IsIconic(badge.target) || !IsWindowVisible(badge.target)) {
     ShowWindow(badge.badge, SW_HIDE);
     return;
   }
@@ -687,7 +707,7 @@ void UpdateBadge(PinBadge& badge) {
       ShowWindow(badge.badge, SW_HIDE);
       return;
     }
-    insertAfter = HWND_TOPMOST;
+    insertAfter = HWND_TOPMOST;  // already topmost since creation; keeps it on top of other topmost windows
   } else {
     // Insert the badge right below the window above the target, i.e. directly above it.
     insertAfter = GetWindow(badge.target, GW_HWNDPREV);
@@ -702,6 +722,11 @@ void UpdateBadge(PinBadge& badge) {
     DWORD error = GetLastError();
     if (error == ERROR_ACCESS_DENIED && !badge.zOrderDenied) {
       Wh_Log(L"Pin badge Z-order denied (elevated window 0x%p?); showing it only while in front", badge.target);
+      HWND topmostBadge = CreateBadgeWindow(true);
+      if (!topmostBadge) return;
+      DestroyWindow(badge.badge);
+      badge.badge = topmostBadge;
+      badge.size = 0;  // the new window needs its region
       badge.zOrderDenied = true;
       UpdateBadge(badge);
       return;
@@ -741,7 +766,7 @@ void StartBadgeTracking() {
   constexpr DWORD kFlags = WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS;
   g_badgeHooks[0] = SetWinEventHook(EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_MINIMIZEEND, nullptr, BadgeWinEventProc,
                                     0, 0, kFlags);
-  g_badgeHooks[1] = SetWinEventHook(EVENT_OBJECT_DESTROY, EVENT_OBJECT_LOCATIONCHANGE, nullptr, BadgeWinEventProc,
+  g_badgeHooks[1] = SetWinEventHook(EVENT_OBJECT_DESTROY, EVENT_OBJECT_UNCLOAKED, nullptr, BadgeWinEventProc,
                                     0, 0, kFlags);
   if (!g_badgeHooks[0] || !g_badgeHooks[1]) Wh_Log(L"SetWinEventHook failed: %lu", GetLastError());
   if (HWND msgWnd = g_hMsgWnd.load()) SetTimer(msgWnd, kBadgeCheckTimerId, kBadgeCheckIntervalMs, nullptr);
@@ -780,14 +805,8 @@ void ShowBadge(HWND target) {
     return;
   }
 
-  HWND badgeWnd = CreateWindowExW(WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
-                                  kBadgeWindowClassName, nullptr, WS_POPUP, 0, 0, 0, 0, nullptr, nullptr,
-                                  GetModuleHandle(nullptr), nullptr);
-  if (!badgeWnd) {
-    Wh_Log(L"Failed to create pin badge: %lu", GetLastError());
-    return;
-  }
-  SetLayeredWindowAttributes(badgeWnd, 0, kBadgeAlpha, LWA_ALPHA);
+  HWND badgeWnd = CreateBadgeWindow(false);
+  if (!badgeWnd) return;
 
   g_badges.push_back({target, badgeWnd, 0, false});
   StartBadgeTracking();
